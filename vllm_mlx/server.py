@@ -2109,15 +2109,35 @@ async def _stream_anthropic_messages(
         # that separate thinking content from user-facing text.
         router: _AnthropicStreamRouter | None = _AnthropicStreamRouter()
         scrubber: _AnthropicStreamScrubber | None = None
+
+        # Open both content blocks upfront so clients know the layout:
+        #   index 0 = thinking block
+        #   index 1 = text block
+        thinking_block_index = next_block_index
+        next_block_index += 1
+        thinking_block_open = True
+        ev = {
+            "type": "content_block_start",
+            "index": thinking_block_index,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }
+        yield f"event: content_block_start\ndata: {json.dumps(ev)}\n\n"
+
+        text_block_index = next_block_index
+        next_block_index += 1
+        text_block_open = True
+        ev = {
+            "type": "content_block_start",
+            "index": text_block_index,
+            "content_block": {"type": "text", "text": ""},
+        }
+        yield f"event: content_block_start\ndata: {json.dumps(ev)}\n\n"
     else:
         # Use the scrubber which simply strips all <think> content.
         router = None
         scrubber = _AnthropicStreamScrubber()
 
-    # Always open the text block up front when thinking is NOT enabled
-    # (preserves existing behaviour).  When thinking IS enabled the text
-    # block will be opened lazily after any thinking block.
-    if not thinking_enabled:
+        # Only text block (index 0).
         text_block_index = next_block_index
         next_block_index += 1
         text_block_open = True
@@ -2150,17 +2170,11 @@ async def _stream_anthropic_messages(
 
                 if router is not None:
                     # ---- Thinking-enabled path (stream router) ----
+                    # Both blocks are opened upfront (thinking=0, text=1).
                     for kind, text in router.feed(content):
                         if kind == "thinking_start":
-                            thinking_block_index = next_block_index
-                            next_block_index += 1
-                            thinking_block_open = True
-                            ev = {
-                                "type": "content_block_start",
-                                "index": thinking_block_index,
-                                "content_block": {"type": "thinking", "thinking": ""},
-                            }
-                            yield f"event: content_block_start\ndata: {json.dumps(ev)}\n\n"
+                            # Block already opened upfront – nothing to do.
+                            pass
 
                         elif kind == "thinking" and text:
                             ev = {
@@ -2177,17 +2191,6 @@ async def _stream_anthropic_messages(
                                 thinking_block_open = False
 
                         elif kind == "text" and text:
-                            # Lazily open the text block on first text piece.
-                            if text_block_index is None:
-                                text_block_index = next_block_index
-                                next_block_index += 1
-                                text_block_open = True
-                                ev = {
-                                    "type": "content_block_start",
-                                    "index": text_block_index,
-                                    "content_block": {"type": "text", "text": ""},
-                                }
-                                yield f"event: content_block_start\ndata: {json.dumps(ev)}\n\n"
                             ev = {
                                 "type": "content_block_delta",
                                 "index": text_block_index,
