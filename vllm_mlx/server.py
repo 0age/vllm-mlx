@@ -1913,9 +1913,13 @@ class _AnthropicStreamRouter:
     _MODE_MAP = _AnthropicStreamScrubber._MODE_MAP
     _CLOSE_MAP = _AnthropicStreamScrubber._CLOSE_MAP
 
-    def __init__(self) -> None:
-        self.mode: str = "TEXT"
+    def __init__(self, start_in_thinking: bool = False) -> None:
+        # When start_in_thinking is True, the router assumes the model is
+        # already inside a <think> block (i.e. the chat template injected
+        # <think> into the prompt, so the first output IS thinking content).
+        self.mode: str = "IN_THINK" if start_in_thinking else "TEXT"
         self.carry: str = ""
+        self._implicit_think = start_in_thinking
         # Delegate marker scanning to a scrubber instance.
         self._scanner = _AnthropicStreamScrubber()
 
@@ -2107,7 +2111,7 @@ async def _stream_anthropic_messages(
     if thinking_enabled:
         # Use the stream router which yields typed (kind, text) pieces
         # that separate thinking content from user-facing text.
-        router: _AnthropicStreamRouter | None = _AnthropicStreamRouter()
+        router: _AnthropicStreamRouter | None = _AnthropicStreamRouter(start_in_thinking=True)
         scrubber: _AnthropicStreamScrubber | None = None
 
         # Open both content blocks upfront so clients know the layout:
