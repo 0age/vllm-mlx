@@ -293,15 +293,11 @@ class TestScrubberParameterTags:
     def test_parameter_tag_single_delta(self):
         scrubber = _AnthropicStreamScrubber()
         result = scrubber.feed("Before <parameter=city>NYC</parameter> After")
-        # parameter= maps to IN_FUNCTION mode, closes on </function>
-        # But </parameter> is consumed as stray closing tag in TEXT mode...
-        # Actually <parameter= opens IN_FUNCTION, and IN_FUNCTION closes on </function>
-        # So </parameter> won't close IN_FUNCTION. Let's verify behavior.
-        # The close for IN_FUNCTION is </function>, so content after <parameter=city>
-        # stays suppressed until </function> is seen or stream ends.
         result += scrubber.flush()
         assert "<parameter=" not in result
+        assert "NYC" not in result
         assert "Before" in result
+        assert "After" in result
 
     def test_stray_parameter_close_suppressed(self):
         """A stray </parameter> tag should be stripped."""
@@ -685,10 +681,10 @@ class TestScrubberStateMachine:
         scrubber.feed("<function=test>body</function>")
         assert scrubber.mode == "TEXT"
 
-    def test_text_to_parameter_enters_function_mode(self):
+    def test_text_to_parameter_enters_parameter_mode(self):
         scrubber = _AnthropicStreamScrubber()
         scrubber.feed("text<parameter=x>")
-        assert scrubber.mode == "IN_FUNCTION"
+        assert scrubber.mode == "IN_PARAMETER"
 
     def test_stray_close_stays_in_text(self):
         """Stray closing tags should not change mode."""
@@ -1337,3 +1333,136 @@ class TestIsThinkingEnabled:
             thinking=AnthropicThinkingConfig(type="disabled"),
         )
         assert _is_thinking_enabled(req) is False
+
+
+# =============================================================================
+# Review Fix Tests
+# =============================================================================
+
+
+class TestScrubberCarryLimit:
+    """Fix 1: Carry buffer must not grow without bound when '>' never arrives."""
+
+    def test_long_false_prefix_emitted(self):
+        """<function= followed by too many chars without '>' is literal text."""
+        scrubber = _AnthropicStreamScrubber()
+        fake = "<function=" + "x" * (scrubber.MAX_TAG * 3)
+        result = scrubber.feed(fake) + scrubber.flush()
+        assert "<function=" in result
+        assert "x" * 10 in result
+
+    def test_incremental_carry_does_not_grow_unbounded(self):
+        """Repeated feeds without '>' must flush carry at some point."""
+        scrubber = _AnthropicStreamScrubber()
+        scrubber.feed("<function=longname")
+        for _ in range(50):
+            scrubber.feed("a" * 100)
+        scrubber.flush()
+        # After processing, the carry should not have grown huge.
+        assert len(scrubber.carry) <= scrubber.MAX_TAG * 2
+
+
+class TestScrubberFlushPartialPrefix:
+    """Fix 2: flush() must strip partial prefix tags at end of stream."""
+
+    def test_partial_function_prefix_stripped(self):
+        scrubber = _AnthropicStreamScrubber()
+        scrubber.carry = "hello<function=myFunc"
+        scrubber.mode = "TEXT"
+        result = scrubber.flush()
+        assert result == "hello"
+
+    def test_partial_parameter_prefix_stripped(self):
+        scrubber = _AnthropicStreamScrubber()
+        scrubber.carry = "hello<parameter=name"
+        scrubber.mode = "TEXT"
+        result = scrubber.flush()
+        assert result == "hello"
+
+    def test_complete_prefix_also_stripped(self):
+        scrubber = _AnthropicStreamScrubber()
+        scrubber.carry = "hello<function=foo>"
+        scrubber.mode = "TEXT"
+        result = scrubber.flush()
+        assert result == "hello"
+
+
+class TestScrubberStandaloneParameter:
+    """Fix 5: Standalone <parameter=...> must close on </parameter>, not </function>."""
+
+    def test_standalone_parameter_closes_on_parameter_close(self):
+        scrubber = _AnthropicStreamScrubber()
+        text = "before<parameter=x>hidden</parameter>after"
+        result = scrubber.feed(text) + scrubber.flush()
+        assert result == "beforeafter"
+
+    def test_standalone_parameter_does_not_eat_until_function_close(self):
+        """<parameter=x> must NOT suppress until </function>."""
+        scrubber = _AnthropicStreamScrubber()
+        text = "before<parameter=x>hidden</parameter>middle</function>after"
+        result = scrubber.feed(text) + scrubber.flush()
+        assert "before" in result
+        assert "middle" in result
+        assert "after" in result
+        assert "hidden" not in result
+
+    def test_parameter_inside_function_still_suppressed(self):
+        """Within <function=...>, everything is suppressed by the outer block."""
+        scrubber = _AnthropicStreamScrubber()
+        text = "ok<function=f><parameter=p>v</parameter></function>done"
+        result = scrubber.feed(text) + scrubber.flush()
+        assert result == "okdone"
+
+
+class TestRouterCarryLimit:
+    """Fix 1: Router carry buffer limit."""
+
+    def test_long_false_prefix_emitted(self):
+        router = _AnthropicStreamRouter()
+        fake = "<function=" + "x" * (router.MAX_TAG * 3)
+        pieces = router.feed(fake) + router.flush()
+        text = "".join(t for k, t in pieces if k == "text")
+        assert "<function=" in text
+
+
+class TestRouterFlushPartialPrefix:
+    """Fix 2: Router flush() strips partial prefixes."""
+
+    def test_partial_function_prefix_stripped(self):
+        router = _AnthropicStreamRouter()
+        router.carry = "hello<function=myFunc"
+        router.mode = "TEXT"
+        pieces = router.flush()
+        text = "".join(t for k, t in pieces if k == "text")
+        assert text == "hello"
+
+    def test_partial_parameter_prefix_stripped(self):
+        router = _AnthropicStreamRouter()
+        router.carry = "hello<parameter=name"
+        router.mode = "TEXT"
+        pieces = router.flush()
+        text = "".join(t for k, t in pieces if k == "text")
+        assert text == "hello"
+
+
+class TestRouterStandaloneParameter:
+    """Fix 5: Router standalone parameter handling."""
+
+    def test_standalone_parameter(self):
+        router = _AnthropicStreamRouter()
+        pieces = router.feed("before<parameter=x>hidden</parameter>after")
+        pieces += router.flush()
+        text = "".join(t for k, t in pieces if k == "text")
+        assert text == "beforeafter"
+
+
+class TestRouterDeadCode:
+    """Fix 4: _implicit_think attribute should not exist."""
+
+    def test_no_implicit_think_attribute(self):
+        router = _AnthropicStreamRouter()
+        assert not hasattr(router, "_implicit_think")
+
+    def test_no_implicit_think_when_start_true(self):
+        router = _AnthropicStreamRouter(start_in_thinking=True)
+        assert not hasattr(router, "_implicit_think")

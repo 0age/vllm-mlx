@@ -42,6 +42,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import tempfile
 import threading
@@ -1690,6 +1691,7 @@ class _AnthropicStreamScrubber:
     * **IN_THINK** – suppress until ``</think>``.
     * **IN_TOOLCALL** – suppress until ``</tool_call>``.
     * **IN_FUNCTION** – suppress until ``</function>``.
+    * **IN_PARAMETER** – suppress until ``</parameter>``.
     """
 
     # --- Fixed (exact-match) tags ----------------------------------------
@@ -1729,7 +1731,7 @@ class _AnthropicStreamScrubber:
         THINK_OPEN: "IN_THINK",
         TOOL_OPEN: "IN_TOOLCALL",
         FUNC_PREFIX: "IN_FUNCTION",
-        PARAM_PREFIX: "IN_FUNCTION",  # parameters inside function blocks
+        PARAM_PREFIX: "IN_PARAMETER",
     }
 
     # Map from suppression mode → closing tag
@@ -1737,6 +1739,7 @@ class _AnthropicStreamScrubber:
         "IN_THINK": THINK_CLOSE,
         "IN_TOOLCALL": TOOL_CLOSE,
         "IN_FUNCTION": FUNC_CLOSE,
+        "IN_PARAMETER": PARAM_CLOSE,
     }
 
     def __init__(self) -> None:
@@ -1817,9 +1820,16 @@ class _AnthropicStreamScrubber:
 
                 if consume < 0:
                     # Prefix tag found but closing '>' missing – truncated.
+                    carry_candidate = s[pos:]
+                    if len(carry_candidate) > self.MAX_TAG * 2:
+                        # Carry grew too large — this is a literal '<',
+                        # not a real tag.  Emit everything and move on.
+                        out.append(s[i : pos + len(marker)])
+                        i = pos + len(marker)
+                        continue
                     if pos > i:
                         out.append(s[i:pos])
-                    self.carry = s[pos:]
+                    self.carry = carry_candidate
                     return "".join(out)
 
                 tag_end = pos + consume
@@ -1870,10 +1880,11 @@ class _AnthropicStreamScrubber:
             for tag in self._EXACT_TAGS:
                 result = result.replace(tag, "")
             # Strip any residual prefix tags (e.g. ``<function=foo>``).
-            import re
-
             result = re.sub(r"<function=[^>]*>", "", result)
             result = re.sub(r"<parameter=[^>]*>", "", result)
+            # Strip partial prefix tags at end of stream (no closing '>').
+            result = re.sub(r"<function=[^>]*$", "", result)
+            result = re.sub(r"<parameter=[^>]*$", "", result)
             self.carry = ""
             return result
         self.carry = ""
@@ -1912,6 +1923,7 @@ class _AnthropicStreamRouter:
 
     _EXACT_TAGS = _AnthropicStreamScrubber._EXACT_TAGS
     _PREFIX_TAGS = _AnthropicStreamScrubber._PREFIX_TAGS
+    MAX_TAG = _AnthropicStreamScrubber.MAX_TAG
     CARRY_N = _AnthropicStreamScrubber.CARRY_N
 
     _MODE_MAP = _AnthropicStreamScrubber._MODE_MAP
@@ -1923,7 +1935,6 @@ class _AnthropicStreamRouter:
         # <think> into the prompt, so the first output IS thinking content).
         self.mode: str = "IN_THINK" if start_in_thinking else "TEXT"
         self.carry: str = ""
-        self._implicit_think = start_in_thinking
         # Delegate marker scanning to a scrubber instance.
         self._scanner = _AnthropicStreamScrubber()
 
@@ -1959,9 +1970,15 @@ class _AnthropicStreamRouter:
                 pos, marker, consume = hit
 
                 if consume < 0:
+                    carry_candidate = s[pos:]
+                    if len(carry_candidate) > self.MAX_TAG * 2:
+                        # Carry grew too large — emit as literal text.
+                        pieces.append(("text", s[i : pos + len(marker)]))
+                        i = pos + len(marker)
+                        continue
                     if pos > i:
                         pieces.append(("text", s[i:pos]))
-                    self.carry = s[pos:]
+                    self.carry = carry_candidate
                     return pieces
 
                 tag_end = pos + consume
@@ -2001,7 +2018,7 @@ class _AnthropicStreamRouter:
                 self.mode = "TEXT"
 
             else:
-                # IN_TOOLCALL or IN_FUNCTION – suppress content.
+                # IN_TOOLCALL, IN_FUNCTION, or IN_PARAMETER – suppress.
                 close_tag = self._CLOSE_MAP[self.mode]
                 close_pos = s.find(close_tag, i)
                 if close_pos == -1:
@@ -2025,10 +2042,11 @@ class _AnthropicStreamRouter:
             result = self.carry
             for tag in self._EXACT_TAGS:
                 result = result.replace(tag, "")
-            import re
-
             result = re.sub(r"<function=[^>]*>", "", result)
             result = re.sub(r"<parameter=[^>]*>", "", result)
+            # Strip partial prefix tags at end of stream (no closing '>').
+            result = re.sub(r"<function=[^>]*$", "", result)
+            result = re.sub(r"<parameter=[^>]*$", "", result)
             if result:
                 pieces.append(("text", result))
         # IN_TOOLCALL/IN_FUNCTION – discard.
@@ -2116,6 +2134,10 @@ async def _stream_anthropic_messages(
     if thinking_enabled:
         # Use the stream router which yields typed (kind, text) pieces
         # that separate thinking content from user-facing text.
+        # start_in_thinking=True is correct for current models (Qwen3/3.5
+        # with --reasoning-parser qwen3): the chat template injects <think>
+        # into the prompt, so the model's first output is thinking content
+        # WITHOUT an explicit <think> tag.
         router: _AnthropicStreamRouter | None = _AnthropicStreamRouter(
             start_in_thinking=True
         )
