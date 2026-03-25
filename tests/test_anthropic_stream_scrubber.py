@@ -8,6 +8,8 @@ Anthropic /v1/messages endpoint.
 These are pure logic tests with no MLX dependency.
 """
 
+import pytest
+
 from vllm_mlx.server import _AnthropicStreamScrubber
 
 # =============================================================================
@@ -293,15 +295,12 @@ class TestScrubberParameterTags:
     def test_parameter_tag_single_delta(self):
         scrubber = _AnthropicStreamScrubber()
         result = scrubber.feed("Before <parameter=city>NYC</parameter> After")
-        # parameter= maps to IN_FUNCTION mode, closes on </function>
-        # But </parameter> is consumed as stray closing tag in TEXT mode...
-        # Actually <parameter= opens IN_FUNCTION, and IN_FUNCTION closes on </function>
-        # So </parameter> won't close IN_FUNCTION. Let's verify behavior.
-        # The close for IN_FUNCTION is </function>, so content after <parameter=city>
-        # stays suppressed until </function> is seen or stream ends.
+        # <parameter= opens IN_PARAMETER mode, closes on </parameter>
         result += scrubber.flush()
         assert "<parameter=" not in result
+        assert "NYC" not in result
         assert "Before" in result
+        assert "After" in result
 
     def test_stray_parameter_close_suppressed(self):
         """A stray </parameter> tag should be stripped."""
@@ -685,10 +684,15 @@ class TestScrubberStateMachine:
         scrubber.feed("<function=test>body</function>")
         assert scrubber.mode == "TEXT"
 
-    def test_text_to_parameter_enters_function_mode(self):
+    def test_text_to_parameter_enters_parameter_mode(self):
         scrubber = _AnthropicStreamScrubber()
         scrubber.feed("text<parameter=x>")
-        assert scrubber.mode == "IN_FUNCTION"
+        assert scrubber.mode == "IN_PARAMETER"
+
+    def test_parameter_back_to_text(self):
+        scrubber = _AnthropicStreamScrubber()
+        scrubber.feed("<parameter=x>body</parameter>")
+        assert scrubber.mode == "TEXT"
 
     def test_stray_close_stays_in_text(self):
         """Stray closing tags should not change mode."""
@@ -1028,6 +1032,167 @@ class TestScrubberZeroLatencyCarry:
         result = scrubber.feed(text)
         assert result == text
         assert scrubber.carry == ""
+
+
+# =============================================================================
+# Carry Buffer Cap (unbounded growth prevention)
+# =============================================================================
+
+
+class TestScrubberCarryCap:
+    """Test that the carry buffer is capped to prevent unbounded growth."""
+
+    def test_max_carry_constant_exists(self):
+        """MAX_CARRY constant should be defined and reasonable."""
+        assert hasattr(_AnthropicStreamScrubber, "MAX_CARRY")
+        assert _AnthropicStreamScrubber.MAX_CARRY > _AnthropicStreamScrubber.CARRY_N
+
+    def test_carry_cap_emits_as_literal(self):
+        """If a prefix tag never closes (>), carry cap emits content as literal text."""
+        scrubber = _AnthropicStreamScrubber()
+        collected = ""
+        collected += scrubber.feed("text <function=name_that_never_closes")
+        # Feed enough characters to exceed MAX_CARRY
+        collected += scrubber.feed("x" * 300)
+        collected += scrubber.flush()
+        # The content should have been emitted as literal text
+        assert "<function=" in collected
+        assert "text" in collected
+
+    def test_carry_does_not_grow_unbounded(self):
+        """Carry buffer should not grow without limit."""
+        scrubber = _AnthropicStreamScrubber()
+        scrubber.feed("<function=start")
+        for _ in range(100):
+            scrubber.feed("more_content_" * 5)
+        # After many feeds, carry should be bounded (cap kicked in)
+        assert len(scrubber.carry) <= scrubber.MAX_CARRY + 100
+
+    def test_carry_cap_resets_cleanly(self):
+        """After cap kicks in, scrubber should resume normal processing."""
+        scrubber = _AnthropicStreamScrubber()
+        collected = ""
+        collected += scrubber.feed("<function=never_closes" + "x" * 300)
+        # Carry cap should have emitted everything as literal text
+        collected += scrubber.feed("normal text after cap")
+        collected += scrubber.flush()
+        assert "normal text after cap" in collected
+
+
+# =============================================================================
+# flush() with Incomplete Prefix Tags
+# =============================================================================
+
+
+class TestScrubberFlushIncompletePrefixTags:
+    """Test that flush() strips incomplete prefix tags without closing '>'."""
+
+    def test_flush_strips_incomplete_function_prefix(self):
+        """flush() strips incomplete <function= prefix without closing >."""
+        scrubber = _AnthropicStreamScrubber()
+        scrubber.carry = "text<function=myFunc"
+        scrubber.mode = "TEXT"
+        flushed = scrubber.flush()
+        assert "<function=" not in flushed
+        assert "text" in flushed
+
+    def test_flush_strips_incomplete_parameter_prefix(self):
+        """flush() strips incomplete <parameter= prefix without closing >."""
+        scrubber = _AnthropicStreamScrubber()
+        scrubber.carry = "text<parameter=arg"
+        scrubber.mode = "TEXT"
+        flushed = scrubber.flush()
+        assert "<parameter=" not in flushed
+        assert "text" in flushed
+
+    def test_flush_strips_both_complete_and_incomplete(self):
+        """flush() handles a mix of complete and incomplete prefix tags."""
+        scrubber = _AnthropicStreamScrubber()
+        scrubber.carry = "a<function=foo>b<parameter=bar"
+        scrubber.mode = "TEXT"
+        flushed = scrubber.flush()
+        assert "<function=" not in flushed
+        assert "<parameter=" not in flushed
+        assert "a" in flushed
+
+    def test_flush_in_parameter_mode_discards(self):
+        """If stream ends inside <parameter=...>, flush returns empty."""
+        scrubber = _AnthropicStreamScrubber()
+        scrubber.feed("<parameter=test>unfinished")
+        assert scrubber.mode == "IN_PARAMETER"
+        flushed = scrubber.flush()
+        assert flushed == ""
+
+
+# =============================================================================
+# IN_PARAMETER State (separate from IN_FUNCTION)
+# =============================================================================
+
+
+class TestScrubberParameterState:
+    """Test the IN_PARAMETER state closes on </parameter> (not </function>)."""
+
+    def test_parameter_closes_on_parameter_tag(self):
+        """<parameter=x>...</parameter> correctly suppresses and closes."""
+        scrubber = _AnthropicStreamScrubber()
+        result = scrubber.feed("before<parameter=city>NYC</parameter>after")
+        result += scrubber.flush()
+        assert "NYC" not in result
+        assert "before" in result
+        assert "after" in result
+        assert scrubber.mode == "TEXT"
+
+    def test_parameter_does_not_close_on_function_tag(self):
+        """IN_PARAMETER mode should NOT close on </function>."""
+        scrubber = _AnthropicStreamScrubber()
+        scrubber.feed("<parameter=x>content</function>still_suppressed")
+        # Should still be in IN_PARAMETER since </function> doesn't close it
+        assert scrubber.mode == "IN_PARAMETER"
+
+    def test_standalone_parameter_with_text_after(self):
+        """Standalone <parameter=name>value</parameter> followed by text."""
+        scrubber = _AnthropicStreamScrubber()
+        result = scrubber.feed(
+            "<parameter=query>search term</parameter> Here is my response."
+        )
+        result += scrubber.flush()
+        assert "search term" not in result
+        assert "<parameter=" not in result
+        assert "</parameter>" not in result
+        assert "Here is my response." in result
+
+
+# =============================================================================
+# Router Inherits Scrubber Behavior
+# =============================================================================
+
+
+class TestRouterInheritsScrubber:
+    """Test that the Router (subclass) inherits all Scrubber capabilities."""
+
+    def test_router_is_subclass(self):
+        from vllm_mlx.server import _AnthropicStreamRouter
+
+        assert issubclass(_AnthropicStreamRouter, _AnthropicStreamScrubber)
+
+    def test_router_has_carry_cap(self):
+        from vllm_mlx.server import _AnthropicStreamRouter
+
+        router = _AnthropicStreamRouter()
+        assert hasattr(router, "MAX_CARRY")
+        assert router.MAX_CARRY == _AnthropicStreamScrubber.MAX_CARRY
+
+    def test_router_parameter_mode(self):
+        """Router should handle IN_PARAMETER the same as scrubber."""
+        from vllm_mlx.server import _AnthropicStreamRouter
+
+        router = _AnthropicStreamRouter()
+        pieces = router.feed("text<parameter=x>suppressed</parameter>after")
+        pieces += router.flush()
+        text = "".join(t for k, t in pieces if k == "text")
+        assert "suppressed" not in text
+        assert "text" in text
+        assert "after" in text
 
 
 # =============================================================================

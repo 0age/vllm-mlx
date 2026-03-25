@@ -42,6 +42,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import tempfile
 import threading
@@ -1682,7 +1683,9 @@ class _AnthropicStreamScrubber:
     Handles tags that may be split across multiple token boundaries by
     maintaining a small carry buffer.  The carry buffer always retains
     the last ``CARRY_N`` characters so that a tag split across two
-    consecutive deltas can still be detected.
+    consecutive deltas can still be detected.  A cap (``MAX_CARRY``)
+    prevents unbounded growth when a prefix tag like ``<function=``
+    appears but the closing ``>`` never arrives.
 
     The scrubber operates as a simple state machine:
 
@@ -1690,6 +1693,7 @@ class _AnthropicStreamScrubber:
     * **IN_THINK** – suppress until ``</think>``.
     * **IN_TOOLCALL** – suppress until ``</tool_call>``.
     * **IN_FUNCTION** – suppress until ``</function>``.
+    * **IN_PARAMETER** – suppress until ``</parameter>``.
     """
 
     # --- Fixed (exact-match) tags ----------------------------------------
@@ -1724,12 +1728,18 @@ class _AnthropicStreamScrubber:
     MAX_TAG = max(len(t) for t in _ALL_MARKERS)
     CARRY_N = MAX_TAG - 1
 
+    # Maximum carry buffer size.  When a prefix tag like ``<function=``
+    # is found but ``>`` never arrives, carry keeps accumulating each
+    # new delta.  Cap it and emit as literal text to prevent unbounded
+    # growth.
+    MAX_CARRY = CARRY_N + 256
+
     # Map from opening signal → suppression mode
     _MODE_MAP = {
         THINK_OPEN: "IN_THINK",
         TOOL_OPEN: "IN_TOOLCALL",
         FUNC_PREFIX: "IN_FUNCTION",
-        PARAM_PREFIX: "IN_FUNCTION",  # parameters inside function blocks
+        PARAM_PREFIX: "IN_PARAMETER",
     }
 
     # Map from suppression mode → closing tag
@@ -1737,6 +1747,7 @@ class _AnthropicStreamScrubber:
         "IN_THINK": THINK_CLOSE,
         "IN_TOOLCALL": TOOL_CLOSE,
         "IN_FUNCTION": FUNC_CLOSE,
+        "IN_PARAMETER": PARAM_CLOSE,
     }
 
     def __init__(self) -> None:
@@ -1780,13 +1791,21 @@ class _AnthropicStreamScrubber:
         return best
 
     # -----------------------------------------------------------------
-    # Public API
+    # Core processing – returns typed pieces
     # -----------------------------------------------------------------
 
-    def feed(self, delta: str) -> str:
-        """Process a new text delta and return only the safe-to-emit portion."""
+    def _feed_pieces(self, delta: str) -> list[tuple[str, str]]:
+        """Core processing: returns ``(kind, text)`` pieces.
+
+        *kind* is one of ``"text"``, ``"thinking_start"``,
+        ``"thinking"``, ``"thinking_stop"``.  Tool / function /
+        parameter content is silently dropped (no pieces emitted).
+
+        Used directly by :class:`_AnthropicStreamRouter`; the
+        scrubber's public :meth:`feed` extracts only ``"text"`` pieces.
+        """
         s = self.carry + (delta or "")
-        out: list[str] = []
+        pieces: list[tuple[str, str]] = []
         slen = len(s)
         i = 0
 
@@ -1805,152 +1824,10 @@ class _AnthropicStreamScrubber:
                         # Keep from the '<' onward as carry.
                         carry_start = max(i, slen - self.CARRY_N) + lt_pos
                         if carry_start > i:
-                            out.append(s[i:carry_start])
-                        self.carry = s[carry_start:]
-                    else:
-                        # No '<' in tail – emit everything.
-                        out.append(s[i:])
-                        self.carry = ""
-                    return "".join(out)
-
-                pos, marker, consume = hit
-
-                if consume < 0:
-                    # Prefix tag found but closing '>' missing – truncated.
-                    if pos > i:
-                        out.append(s[i:pos])
-                    self.carry = s[pos:]
-                    return "".join(out)
-
-                tag_end = pos + consume
-                if tag_end > slen:
-                    # Full tag not in buffer yet.
-                    if pos > i:
-                        out.append(s[i:pos])
-                    self.carry = s[pos:]
-                    return "".join(out)
-
-                # Emit text before the tag.
-                if pos > i:
-                    out.append(s[i:pos])
-
-                # Consume the tag.
-                i = tag_end
-
-                # Determine new mode (if any).
-                new_mode = self._MODE_MAP.get(marker)
-                if new_mode:
-                    self.mode = new_mode
-                # else: stray closing tag – consumed and suppressed, stay TEXT.
-
-            else:
-                # In a suppression mode – find the closing tag.
-                close_tag = self._CLOSE_MAP[self.mode]
-                close_pos = s.find(close_tag, i)
-                if close_pos == -1:
-                    # Closing tag not yet in buffer.
-                    self.carry = s[max(i, slen - self.CARRY_N) :]
-                    return "".join(out)
-                i = close_pos + len(close_tag)
-                self.mode = "TEXT"
-
-        # Entire buffer consumed.
-        self.carry = ""
-        return "".join(out)
-
-    def flush(self) -> str:
-        """Flush remaining carry buffer at end of stream.
-
-        Emits leftover text only in TEXT mode (stripping any stray tags);
-        discards carry if inside a suppressed region.
-        """
-        if self.mode == "TEXT":
-            result = self.carry
-            # Strip any residual exact tags.
-            for tag in self._EXACT_TAGS:
-                result = result.replace(tag, "")
-            # Strip any residual prefix tags (e.g. ``<function=foo>``).
-            import re
-
-            result = re.sub(r"<function=[^>]*>", "", result)
-            result = re.sub(r"<parameter=[^>]*>", "", result)
-            self.carry = ""
-            return result
-        self.carry = ""
-        return ""
-
-
-class _AnthropicStreamRouter:
-    """Stream router that translates ``<think>`` regions into Anthropic
-    ``thinking_delta`` events while still suppressing tool-call markup.
-
-    Unlike :class:`_AnthropicStreamScrubber` (which drops *everything*
-    inside ``<think>``), this router *yields* thinking content so it can
-    be emitted on a separate ``thinking`` content-block channel.
-
-    ``feed()`` returns a list of ``(kind, text)`` tuples:
-
-    * ``("text", "...")`` – normal text for ``text_delta``
-    * ``("thinking_start", "")`` – signals start of a thinking block
-    * ``("thinking", "...")`` – thinking content for ``thinking_delta``
-    * ``("thinking_stop", "")`` – signals end of a thinking block
-    * Tool-call / function / parameter content is silently suppressed.
-
-    The router reuses the same tag-detection helpers as
-    :class:`_AnthropicStreamScrubber`.
-    """
-
-    # Reuse tag constants from the scrubber.
-    THINK_OPEN = _AnthropicStreamScrubber.THINK_OPEN
-    THINK_CLOSE = _AnthropicStreamScrubber.THINK_CLOSE
-    TOOL_OPEN = _AnthropicStreamScrubber.TOOL_OPEN
-    TOOL_CLOSE = _AnthropicStreamScrubber.TOOL_CLOSE
-    FUNC_CLOSE = _AnthropicStreamScrubber.FUNC_CLOSE
-    PARAM_CLOSE = _AnthropicStreamScrubber.PARAM_CLOSE
-    FUNC_PREFIX = _AnthropicStreamScrubber.FUNC_PREFIX
-    PARAM_PREFIX = _AnthropicStreamScrubber.PARAM_PREFIX
-
-    _EXACT_TAGS = _AnthropicStreamScrubber._EXACT_TAGS
-    _PREFIX_TAGS = _AnthropicStreamScrubber._PREFIX_TAGS
-    CARRY_N = _AnthropicStreamScrubber.CARRY_N
-
-    _MODE_MAP = _AnthropicStreamScrubber._MODE_MAP
-    _CLOSE_MAP = _AnthropicStreamScrubber._CLOSE_MAP
-
-    def __init__(self, start_in_thinking: bool = False) -> None:
-        # When start_in_thinking is True, the router assumes the model is
-        # already inside a <think> block (i.e. the chat template injected
-        # <think> into the prompt, so the first output IS thinking content).
-        self.mode: str = "IN_THINK" if start_in_thinking else "TEXT"
-        self.carry: str = ""
-        self._implicit_think = start_in_thinking
-        # Delegate marker scanning to a scrubber instance.
-        self._scanner = _AnthropicStreamScrubber()
-
-    def _find_earliest_marker(self, s: str, start: int):
-        return self._scanner._find_earliest_marker(s, start)
-
-    def feed(self, delta: str) -> list[tuple[str, str]]:
-        """Process a delta and return a list of ``(kind, text)`` pieces."""
-        s = self.carry + (delta or "")
-        pieces: list[tuple[str, str]] = []
-        slen = len(s)
-        i = 0
-
-        while i < slen:
-            if self.mode == "TEXT":
-                hit = self._find_earliest_marker(s, i)
-
-                if hit is None:
-                    # No marker – emit text, retain carry only if '<' near tail.
-                    tail = s[max(i, slen - self.CARRY_N) :]
-                    lt_pos = tail.rfind("<")
-                    if lt_pos != -1:
-                        carry_start = max(i, slen - self.CARRY_N) + lt_pos
-                        if carry_start > i:
                             pieces.append(("text", s[i:carry_start]))
                         self.carry = s[carry_start:]
                     else:
+                        # No '<' in tail – emit everything.
                         if slen > i:
                             pieces.append(("text", s[i:]))
                         self.carry = ""
@@ -1959,13 +1836,21 @@ class _AnthropicStreamRouter:
                 pos, marker, consume = hit
 
                 if consume < 0:
+                    # Prefix tag found but closing '>' missing – truncated.
                     if pos > i:
                         pieces.append(("text", s[i:pos]))
-                    self.carry = s[pos:]
+                    # Cap carry growth: if the partial prefix tag region
+                    # exceeds MAX_CARRY, treat it as plain text.
+                    if slen - pos > self.MAX_CARRY:
+                        pieces.append(("text", s[pos:]))
+                        self.carry = ""
+                    else:
+                        self.carry = s[pos:]
                     return pieces
 
                 tag_end = pos + consume
                 if tag_end > slen:
+                    # Full tag not in buffer yet.
                     if pos > i:
                         pieces.append(("text", s[i:pos]))
                     self.carry = s[pos:]
@@ -1975,13 +1860,16 @@ class _AnthropicStreamRouter:
                 if pos > i:
                     pieces.append(("text", s[i:pos]))
 
+                # Consume the tag.
                 i = tag_end
+
+                # Determine new mode (if any).
                 new_mode = self._MODE_MAP.get(marker)
                 if new_mode:
                     self.mode = new_mode
                     if new_mode == "IN_THINK":
                         pieces.append(("thinking_start", ""))
-                # else: stray closing tag – consumed silently
+                # else: stray closing tag – consumed and suppressed, stay TEXT.
 
             elif self.mode == "IN_THINK":
                 # Find closing </think>.
@@ -2001,20 +1889,22 @@ class _AnthropicStreamRouter:
                 self.mode = "TEXT"
 
             else:
-                # IN_TOOLCALL or IN_FUNCTION – suppress content.
+                # IN_TOOLCALL, IN_FUNCTION, or IN_PARAMETER – suppress.
                 close_tag = self._CLOSE_MAP[self.mode]
                 close_pos = s.find(close_tag, i)
                 if close_pos == -1:
+                    # Closing tag not yet in buffer.
                     self.carry = s[max(i, slen - self.CARRY_N) :]
                     return pieces
                 i = close_pos + len(close_tag)
                 self.mode = "TEXT"
 
+        # Entire buffer consumed.
         self.carry = ""
         return pieces
 
-    def flush(self) -> list[tuple[str, str]]:
-        """Flush at end of stream."""
+    def _flush_pieces(self) -> list[tuple[str, str]]:
+        """Core flush processing: returns ``(kind, text)`` pieces."""
         pieces: list[tuple[str, str]] = []
         if self.mode == "IN_THINK":
             # Emit any remaining thinking content.
@@ -2023,18 +1913,75 @@ class _AnthropicStreamRouter:
             pieces.append(("thinking_stop", ""))
         elif self.mode == "TEXT" and self.carry:
             result = self.carry
+            # Strip residual exact tags.
             for tag in self._EXACT_TAGS:
                 result = result.replace(tag, "")
-            import re
-
+            # Strip complete prefix tags (e.g. ``<function=foo>``).
             result = re.sub(r"<function=[^>]*>", "", result)
             result = re.sub(r"<parameter=[^>]*>", "", result)
+            # Strip incomplete prefix tags without closing ``>``.
+            result = re.sub(r"<function=[^>]*$", "", result)
+            result = re.sub(r"<parameter=[^>]*$", "", result)
             if result:
                 pieces.append(("text", result))
-        # IN_TOOLCALL/IN_FUNCTION – discard.
+        # IN_TOOLCALL / IN_FUNCTION / IN_PARAMETER – discard.
         self.carry = ""
         self.mode = "TEXT"
         return pieces
+
+    # -----------------------------------------------------------------
+    # Public API
+    # -----------------------------------------------------------------
+
+    def feed(self, delta: str) -> str:
+        """Process a new text delta and return only the safe-to-emit portion.
+
+        Think content is suppressed (dropped).
+        """
+        pieces = self._feed_pieces(delta)
+        return "".join(text for kind, text in pieces if kind == "text")
+
+    def flush(self) -> str:
+        """Flush remaining carry buffer at end of stream.
+
+        Emits leftover text only in TEXT mode (stripping any stray tags);
+        discards carry if inside a suppressed region.
+        """
+        pieces = self._flush_pieces()
+        return "".join(text for kind, text in pieces if kind == "text")
+
+
+class _AnthropicStreamRouter(_AnthropicStreamScrubber):
+    """Stream router that translates ``<think>`` regions into Anthropic
+    ``thinking_delta`` events while still suppressing tool-call markup.
+
+    Subclasses :class:`_AnthropicStreamScrubber` to reuse tag detection,
+    carry-buffer management, and the core state-machine loop.  Instead
+    of dropping ``<think>`` content, the router exposes the typed
+    ``(kind, text)`` pieces from ``_feed_pieces`` / ``_flush_pieces``
+    so they can be emitted on separate content-block channels.
+
+    ``feed()`` returns a list of ``(kind, text)`` tuples:
+
+    * ``("text", "...")`` – normal text for ``text_delta``
+    * ``("thinking_start", "")`` – signals start of a thinking block
+    * ``("thinking", "...")`` – thinking content for ``thinking_delta``
+    * ``("thinking_stop", "")`` – signals end of a thinking block
+    * Tool-call / function / parameter content is silently suppressed.
+    """
+
+    def __init__(self, start_in_thinking: bool = False) -> None:
+        super().__init__()
+        if start_in_thinking:
+            self.mode = "IN_THINK"
+
+    def feed(self, delta: str) -> list[tuple[str, str]]:
+        """Process a delta and return a list of ``(kind, text)`` pieces."""
+        return self._feed_pieces(delta)
+
+    def flush(self) -> list[tuple[str, str]]:
+        """Flush at end of stream."""
+        return self._flush_pieces()
 
 
 def _is_thinking_enabled(anthropic_request: AnthropicRequest) -> bool:
@@ -2117,7 +2064,7 @@ async def _stream_anthropic_messages(
         # Use the stream router which yields typed (kind, text) pieces
         # that separate thinking content from user-facing text.
         router: _AnthropicStreamRouter | None = _AnthropicStreamRouter(
-            start_in_thinking=True
+            start_in_thinking=False
         )
         scrubber: _AnthropicStreamScrubber | None = None
 
